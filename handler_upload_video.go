@@ -86,14 +86,17 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	aspect, err := getVideoAspectRatio(tmp.Name())
+	processedPath, err := processVideoForFastStart(tmp.Name())
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Couldn't determine aspect ratio", err)
+		respondWithError(w, http.StatusInternalServerError, "Couldn't process video for faststart", err)
 		return
 	}
 
-	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Couldn't seek temp file", err)
+	_ = os.Remove(tmp.Name())
+
+	aspect, err := getVideoAspectRatio(processedPath)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't determine aspect ratio", err)
 		return
 	}
 
@@ -111,10 +114,18 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 	key := fmt.Sprintf("%s/%x.mp4", prefix, rnd)
 
+	procFile, err := os.Open(processedPath)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't open processed file", err)
+		return
+	}
+	defer procFile.Close()
+	defer os.Remove(processedPath)
+
 	_, err = cfg.s3Client.PutObject(context.Background(), &s3.PutObjectInput{
 		Bucket:      aws.String(cfg.s3Bucket),
 		Key:         aws.String(key),
-		Body:        tmp,
+		Body:        procFile,
 		ContentType: aws.String(mediaType),
 	})
 	if err != nil {
@@ -122,8 +133,8 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	videoURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, key)
-	video.VideoURL = &videoURL
+	cfURL := fmt.Sprintf("%s/%s", cfg.s3CfDistribution, key)
+	video.VideoURL = &cfURL
 
 	if err := cfg.db.UpdateVideo(video); err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't update video", err)
@@ -171,4 +182,16 @@ func getVideoAspectRatio(filePath string) (string, error) {
     }
 
     return "other", nil
+}
+
+func processVideoForFastStart(filePath string) (string, error) {
+	out := filePath + ".processing"
+	cmd := exec.Command("ffmpeg", "-i", filePath, "-c", "copy", "-movflags", "faststart", "-f", "mp4", out)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("ffmpeg failed: %v: %s", err, stderr.String())
+	}
+	return out, nil
 }
